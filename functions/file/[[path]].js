@@ -76,9 +76,14 @@ export async function onRequest(context) {  // Contents of context object
 
     // 从数据库中获取图片记录
     const db = getDatabase(env);
-    const imgRecord = await db.getWithMetadata(fileId);
+    let imgRecord = await db.getWithMetadata(fileId);
     if (!imgRecord) {
-        return new Response('Error: Image Not Found', { status: 404 });
+        // [mirror fallback] KV 未登记的 COS→R2 镜像对象，按路径回源到 clx-r2。
+        // 仅放行镜像前缀，避免把任意 404 路径变成 R2 探测口。
+        imgRecord = buildMirrorFallbackRecord(fileId, env);
+        if (!imgRecord) {
+            return new Response('Error: Image Not Found', { status: 404 });
+        }
     }
 
     // 如果metadata不存在，只可能是之前未设置KV，且存储在Telegraph上的图片
@@ -132,6 +137,33 @@ export async function onRequest(context) {  // Contents of context object
 }
 
 // 按存储渠道读取文件内容
+// COS -> R2 镜像对象的 KV 免登记回源：零 KV 写入，118,056 个对象即刻可读。
+function buildMirrorFallbackRecord(fileId, env) {
+    const prefix  = env.WB_MIRROR_PREFIX || 'images/';
+    const channel = env.WB_MIRROR_S3_CHANNEL || 'clx-r2';
+    if (typeof fileId !== 'string' || !fileId.startsWith(prefix)) return null;
+    // params.path 以逗号还原目录分隔符（见 onRequest），逗号/反斜杠/.. 一律拒绝。
+    if (fileId.includes(',') || fileId.includes('\\') || fileId.includes('..')) return null;
+
+    const name = fileId.slice(fileId.lastIndexOf('/') + 1);
+    const dot  = name.lastIndexOf('.');
+    const ext  = dot >= 0 ? name.slice(dot + 1).toLowerCase() : '';
+    const MIME = {
+        jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png',
+        gif: 'image/gif', webp: 'image/webp', bmp: 'image/bmp', svg: 'image/svg+xml'
+    };
+    return {
+        value: '',
+        metadata: {
+            Channel: 'S3',
+            ChannelName: channel,            // findConfiguredChannel 精确匹配 clx-r2
+            S3FileKey: fileId,              // R2 key == COS key，保持中文/大小写/层级
+            FileName: name,
+            FileType: MIME[ext] || 'application/octet-stream'
+        }
+    };
+}
+
 async function serveFileContent(context, db, imgRecord, fileId, encodedFileName, fileType) {
     const { request, env, url } = context;
 
@@ -916,6 +948,10 @@ async function handleS3FileViaAPI(context, metadata, encodedFileName, fileType) 
         });
 
     } catch (error) {
+        const code = error?.$metadata?.httpStatusCode;
+        if (code === 404 || error?.name === 'NoSuchKey' || error?.name === 'NotFound') {
+            return await return404(url);
+        }
         return new Response(`Error: Failed to fetch from S3 - ${error.message}`, { status: 500 });
     }
 }
